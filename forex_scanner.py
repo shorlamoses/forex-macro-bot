@@ -29,7 +29,7 @@ def start_health_server():
     server.serve_forever()
 
 # --- FOREX MARKET SENTINEL (EUR/USD & GBP/USD) ---
-class ForexMarketSentinel:
+class ForexSentinel:
     def __init__(self):
         self.macro = ForexMacroEngine()
         self.smc = ForexSMCEngine()
