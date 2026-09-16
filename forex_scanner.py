@@ -119,5 +119,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
 
-    sentinel = ForexMarketSentinel()
+    sentinel = ForexSentinel()
     sentinel.start()
