@@ -10,10 +10,10 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 class ForexSMCEngine:
     def __init__(self):
         self.api_key = TWELVE_DATA_API_KEY
-        self.pip_size = 0.0001  # 1 pip on EUR/USD and GBP/USD
+        self.pip_size = 0.0001
 
-    def fetch_data(self, pair="EUR/USD", interval="5min", outputsize=70) -> pd.DataFrame:
-        """Pulls spot forex candles from Twelve Data."""
+    def fetch_data(self, pair="EUR/USD", interval="5min", outputsize=200) -> pd.DataFrame:
+        """Pulls 200 candles (~16.6 hours) to guarantee Asian session is always present."""
         if not self.api_key:
             return pd.DataFrame()
 
@@ -39,7 +39,7 @@ class ForexSMCEngine:
             return pd.DataFrame()
 
     def get_session_liquidity(self, df: pd.DataFrame) -> dict:
-        """Calculates Asian Range (00:00-06:00 UTC) and PDH/PDL in pips."""
+        """Calculates Asian Range (00:00-06:00 UTC) and Previous Day High/Low."""
         if df.empty:
             return {}
 
@@ -51,8 +51,10 @@ class ForexSMCEngine:
             asian_high = round(asian_df['High'].max(), 5)
             asian_low = round(asian_df['Low'].min(), 5)
         else:
-            asian_high = round(df['High'].iloc[-24:].max(), 5)
-            asian_low = round(df['Low'].iloc[-24:].min(), 5)
+            # Fallback to earliest candles of the day
+            today_candles = df[df.index.date == today]
+            asian_high = round(today_candles['High'].iloc[:36].max() if len(today_candles) >= 36 else df['High'].max(), 5)
+            asian_low = round(today_candles['Low'].iloc[:36].min() if len(today_candles) >= 36 else df['Low'].min(), 5)
 
         yesterday_df = df[df.index.date < today]
         if not yesterday_df.empty:
@@ -61,8 +63,8 @@ class ForexSMCEngine:
             pdh = round(last_candles['High'].max(), 5)
             pdl = round(last_candles['Low'].min(), 5)
         else:
-            pdh = round(df['High'].max(), 5)
-            pdl = round(df['Low'].min(), 5)
+            pdh = asian_high
+            pdl = asian_low
 
         curr_price = round(df['Close'].iloc[-1], 5)
 
@@ -75,22 +77,24 @@ class ForexSMCEngine:
         }
 
     def detect_fvg(self, df: pd.DataFrame) -> list:
-        """Detects unmitigated Fair Value Gaps."""
+        """Detects active 3-candle Fair Value Gaps."""
         fvgs = []
         if len(df) < 5:
             return fvgs
 
-        for i in range(len(df) - 15, len(df) - 1):
+        for i in range(len(df) - 20, len(df) - 1):
             c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
 
-            if c1['High'] < c3['Low']:  # Bullish FVG
+            # Bullish FVG
+            if c1['High'] < c3['Low']:
                 gap_top = round(c3['Low'], 5)
                 gap_bottom = round(c1['High'], 5)
                 subsequent_lows = df['Low'].iloc[i+1:].min() if i + 1 < len(df) else 999
                 if subsequent_lows > gap_bottom:
                     fvgs.append({"type": "BULLISH_FVG", "top": gap_top, "bottom": gap_bottom})
 
-            elif c1['Low'] > c3['High']:  # Bearish FVG
+            # Bearish FVG
+            elif c1['Low'] > c3['High']:
                 gap_top = round(c1['Low'], 5)
                 gap_bottom = round(c3['High'], 5)
                 subsequent_highs = df['High'].iloc[i+1:].max() if i + 1 < len(df) else 0
@@ -99,8 +103,8 @@ class ForexSMCEngine:
         return fvgs
 
     def scan_pair(self, pair: str, macro_report: dict) -> dict:
-        """Scans EUR/USD or GBP/USD for SMC setups aligned with Macro."""
-        df = self.fetch_data(pair=pair)
+        """Scans for institutional sweeps of Asian High/Low OR PDH/PDL."""
+        df = self.fetch_data(pair=pair, outputsize=200)
         if df.empty:
             return {"status": "NO_DATA"}
 
@@ -109,31 +113,40 @@ class ForexSMCEngine:
         curr = levels["current_price"]
         macro_score = macro_report.get("macro_score", 0)
 
-        # Check last 8 candles (past 40 mins) for liquidity sweeps
-        recent = df.iloc[-8:]
-        high_sweep = recent['High'].max() > levels['asian_high'] and curr < levels['asian_high']
-        low_sweep = recent['Low'].min() < levels['asian_low'] and curr > levels['asian_low']
+        # Look back 20 candles (~100 minutes) to give ample time for Displacement & FVG Retest
+        recent = df.iloc[-20:]
+
+        # Check for sweeps of EITHER Asian Range OR Previous Day Range
+        asian_high_swept = recent['High'].max() > levels['asian_high'] and curr < levels['asian_high']
+        pdh_swept = recent['High'].max() > levels['pdh'] and curr < levels['pdh']
+        high_sweep = asian_high_swept or pdh_swept
+        sweep_level_high = levels['pdh'] if pdh_swept else levels['asian_high']
+
+        asian_low_swept = recent['Low'].min() < levels['asian_low'] and curr > levels['asian_low']
+        pdl_swept = recent['Low'].min() < levels['pdl'] and curr > levels['pdl']
+        low_sweep = asian_low_swept or pdl_swept
+        sweep_level_low = levels['pdl'] if pdl_swept else levels['asian_low']
 
         setup = None
 
         # ---------------- BEARISH SETUP (SHORTS) ----------------
         if macro_score <= 0 and high_sweep:
             bearish_fvgs = [f for f in fvgs if f["type"] == "BEARISH_FVG"]
-            entry_top = bearish_fvgs[-1]["top"] if bearish_fvgs else round(curr + 0.0004, 5)
+            entry_top = bearish_fvgs[-1]["top"] if bearish_fvgs else round(curr + 0.0003, 5)
             entry_bottom = bearish_fvgs[-1]["bottom"] if bearish_fvgs else round(curr + 0.0001, 5)
-            
-            # SL placed 3 pips above the swept high
+
             sl_price = round(recent['High'].max() + (3 * self.pip_size), 5)
             risk_pips = round(abs(sl_price - entry_top) / self.pip_size, 1)
             tp1 = round(entry_bottom - (risk_pips * 2 * self.pip_size), 5)
             tp2 = levels['asian_low']
             rr = round(abs(entry_bottom - tp2) / ((risk_pips * self.pip_size) or 0.0001), 1)
 
+            reason_str = "PDH Swept" if pdh_swept else "Asian High Swept"
             setup = {
                 "pair": pair,
                 "signal": "SELL LIMIT",
                 "direction": "BEARISH",
-                "reason": f"Asian High Liquidity Swept on {pair} + Macro Bearish Alignment",
+                "reason": f"{reason_str} on {pair} + Macro Bearish Alignment",
                 "entry_zone": f"{entry_bottom:.5f} - {entry_top:.5f}",
                 "stop_loss": f"{sl_price:.5f}",
                 "sl_pips": risk_pips,
@@ -146,20 +159,20 @@ class ForexSMCEngine:
         elif macro_score >= 0 and low_sweep:
             bullish_fvgs = [f for f in fvgs if f["type"] == "BULLISH_FVG"]
             entry_top = bullish_fvgs[-1]["top"] if bullish_fvgs else round(curr - 0.0001, 5)
-            entry_bottom = bullish_fvgs[-1]["bottom"] if bullish_fvgs else round(curr - 0.0004, 5)
+            entry_bottom = bullish_fvgs[-1]["bottom"] if bullish_fvgs else round(curr - 0.0003, 5)
 
-            # SL placed 3 pips below the swept low
             sl_price = round(recent['Low'].min() - (3 * self.pip_size), 5)
             risk_pips = round(abs(entry_bottom - sl_price) / self.pip_size, 1)
             tp1 = round(entry_top + (risk_pips * 2 * self.pip_size), 5)
             tp2 = levels['asian_high']
             rr = round(abs(tp2 - entry_top) / ((risk_pips * self.pip_size) or 0.0001), 1)
 
+            reason_str = "PDL Swept" if pdl_swept else "Asian Low Swept"
             setup = {
                 "pair": pair,
                 "signal": "BUY LIMIT",
                 "direction": "BULLISH",
-                "reason": f"Asian Low Liquidity Swept on {pair} + Macro Bullish Alignment",
+                "reason": f"{reason_str} on {pair} + Macro Bullish Alignment",
                 "entry_zone": f"{entry_bottom:.5f} - {entry_top:.5f}",
                 "stop_loss": f"{sl_price:.5f}",
                 "sl_pips": risk_pips,
@@ -175,29 +188,3 @@ class ForexSMCEngine:
             "active_setup": setup,
             "fvgs": fvgs[-3:] if fvgs else []
         }
-
-if __name__ == "__main__":
-    from forex_macro_engine import ForexMacroEngine
-
-    print("\n--- Testing Spot Forex SMC Detection ---")
-    macro = ForexMacroEngine()
-    smc = ForexSMCEngine()
-
-    for p in ["EUR/USD", "GBP/USD"]:
-        rep = macro.calculate_pair_bias(p)
-        result = smc.scan_pair(p, rep)
-
-        print(f"\n================ {p} SMC STATUS ================")
-        if result["status"] == "READY":
-            l = result["levels"]
-            print(f"Spot Price:   {l['current_price']}")
-            print(f"Asian Range:  {l['asian_low']}  <--->  {l['asian_high']}")
-            print(f"Prev Day:     {l['pdl']}  <--->  {l['pdh']}")
-            print(f"Active FVGs:  {len(result['fvgs'])}")
-            if result["active_setup"]:
-                s = result["active_setup"]
-                print(f"🚨 ACTIVE SETUP: {s['signal']} | SL: {s['sl_pips']} pips | RR: {s['risk_reward']}")
-            else:
-                print(f"⏳ STATUS: SCANNING (Waiting for sweep of {l['asian_high']} or {l['asian_low']})")
-        else:
-            print("⚠️ Waiting for Twelve Data candle feed...")
