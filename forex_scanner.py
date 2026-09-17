@@ -11,7 +11,6 @@ from forex_telegram import ForexTelegramNotifier
 
 load_dotenv()
 
-# --- HTTP HEALTH SERVER (RESPONDS 200 OK TO CRON-JOB) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -28,7 +27,6 @@ def start_health_server():
     print(f"📡 Forex Sentinel Health Server online on port {port}")
     server.serve_forever()
 
-# --- FOREX MARKET SENTINEL (EUR/USD & GBP/USD) ---
 class ForexSentinel:
     def __init__(self):
         self.macro = ForexMacroEngine()
@@ -36,8 +34,17 @@ class ForexSentinel:
         self.notifier = ForexTelegramNotifier()
 
         self.last_briefing_date = None
-        self.last_bias = {"EUR/USD": None, "GBP/USD": None}
+        # Stores simplified bias: "BULLISH", "BEARISH", "NEUTRAL"
+        self.last_core_bias = {"EUR/USD": None, "GBP/USD": None}
         self.last_signal_keys = {"EUR/USD": None, "GBP/USD": None}
+
+    def simplify_bias(self, bias_str: str) -> str:
+        """Eliminates micro-flickering between Mild and Strong."""
+        if "BULLISH" in bias_str:
+            return "BULLISH"
+        elif "BEARISH" in bias_str:
+            return "BEARISH"
+        return "NEUTRAL"
 
     def get_session_context(self) -> tuple:
         now_utc = datetime.now(timezone.utc)
@@ -52,25 +59,27 @@ class ForexSentinel:
     def check_daily_briefing(self, eur_rep: dict, gbp_rep: dict):
         now_utc = datetime.now(timezone.utc)
         if self.last_briefing_date != now_utc.date() and now_utc.hour >= 6:
+            print("[Alert]: Dispatching Daily Forex Pre-Market Briefing to Telegram...")
             self.notifier.send_macro_briefing(eur_rep, gbp_rep)
             self.last_briefing_date = now_utc.date()
 
     def check_macro_shift(self, pair: str, rep: dict):
-        new_bias = rep["macro_bias"]
-        old_bias = self.last_bias[pair]
+        current_core = self.simplify_bias(rep["macro_bias"])
+        old_core = self.last_core_bias[pair]
 
-        if old_bias is None:
-            self.last_bias[pair] = new_bias
+        if old_core is None:
+            self.last_core_bias[pair] = current_core
             return
 
-        if new_bias != old_bias:
-            self.last_bias[pair] = new_bias
+        # ONLY ping if the actual directional polarity flips (e.g. Bearish -> Bullish)
+        if current_core != old_core:
+            self.last_core_bias[pair] = current_core
             flag = "🇪🇺" if "EUR" in pair else "🇬🇧"
             msg = (
-                f"🔄 {flag} <b>{pair} MACRO SHIFT</b>\n"
+                f"🔄 {flag} <b>{pair} MACRO DIRECTION FLIP</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"• <b>Prior Bias:</b> {old_bias}\n"
-                f"• <b>New Bias:</b> <b>{new_bias}</b> ({rep['macro_score']}/5)\n"
+                f"• <b>Prior Direction:</b> {old_core}\n"
+                f"• <b>New Direction:</b> <b>{current_core}</b> ({rep['macro_score']}/5)\n"
                 f"🎯 <b>Directive:</b> <code>{rep['directive']}</code>"
             )
             self.notifier.send_message(msg)
@@ -98,7 +107,7 @@ class ForexSentinel:
             if setup:
                 setup_key = f"{pair}_{setup['signal']}_{setup['entry_zone']}"
                 if setup_key != self.last_signal_keys[pair]:
-                    print(f"🚨 [{pair} SETUP TRIGGERED] Pinging Telegram...")
+                    print(f"🚨 [{pair} TRADE SIGNAL FOUND] Alerting Telegram...")
                     self.notifier.send_forex_trade_alert(setup, macro_rep)
                     self.last_signal_keys[pair] = setup_key
 
@@ -114,6 +123,9 @@ class ForexSentinel:
 
             _, _, sleep_sec = self.get_session_context()
             time.sleep(sleep_sec)
+
+# Alias so both names import cleanly without error
+ForexMarketSentinel = ForexSentinel
 
 if __name__ == "__main__":
     t = threading.Thread(target=start_health_server, daemon=True)
