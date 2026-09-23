@@ -24,7 +24,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"📡 Forex Sentinel Health Server online on port {port}")
     server.serve_forever()
 
 class ForexSentinel:
@@ -34,97 +33,157 @@ class ForexSentinel:
         self.notifier = ForexTelegramNotifier()
 
         self.last_briefing_date = None
-        # Stores simplified bias: "BULLISH", "BEARISH", "NEUTRAL"
-        self.last_core_bias = {"EUR/USD": None, "GBP/USD": None}
+        self.last_summary_date = None
         self.last_signal_keys = {"EUR/USD": None, "GBP/USD": None}
 
-    def simplify_bias(self, bias_str: str) -> str:
-        """Eliminates micro-flickering between Mild and Strong."""
-        if "BULLISH" in bias_str:
-            return "BULLISH"
-        elif "BEARISH" in bias_str:
-            return "BEARISH"
-        return "NEUTRAL"
+        # Daily Trade Ledger
+        self.daily_trades = []
 
-    def get_session_context(self) -> tuple:
+    def is_market_open(self) -> tuple:
+        """Enforces weekend and daily rollover blackouts."""
         now_utc = datetime.now(timezone.utc)
+        weekday = now_utc.weekday()
         hour = now_utc.hour
-        if (7 <= hour < 11) or (12 <= hour < 16):
-            return True, "Active Killzone", 180
-        elif 6 <= hour < 18:
-            return True, "Regular Market Hours", 300
-        else:
-            return False, "Asian / Off-Hours", 600
 
-    def check_daily_briefing(self, eur_rep: dict, gbp_rep: dict):
+        if weekday == 4 and hour >= 21:
+            return False, "Weekend (Friday Market Close)"
+        if weekday == 5:
+            return False, "Weekend (Market Closed)"
+        if weekday == 6 and hour < 21:
+            return False, "Weekend (Pre-Market Open)"
+        if hour == 21:
+            return False, "Daily Bank Rollover Blackout"
+
+        return True, "Market Open"
+
+    def update_trade_outcomes(self, pair: str, current_candle: dict):
+        high = current_candle["High"]
+        low = current_candle["Low"]
+
+        for trade in self.daily_trades:
+            if trade["pair"] == pair and trade["status"] == "OPEN":
+                if trade["direction"] == "BULLISH":
+                    if low <= trade["sl"]:
+                        trade["status"] = "HIT_SL"
+                    elif high >= trade["tp2"]:
+                        trade["status"] = "HIT_TP2"
+                    elif high >= trade["tp1"]:
+                        trade["status"] = "HIT_TP1"
+
+                elif trade["direction"] == "BEARISH":
+                    if high >= trade["sl"]:
+                        trade["status"] = "HIT_SL"
+                    elif low <= trade["tp2"]:
+                        trade["status"] = "HIT_TP2"
+                    elif low <= trade["tp1"]:
+                        trade["status"] = "HIT_TP1"
+
+    def send_daily_summary(self):
+        """Sends daily performance recap at 20:00 UTC (21:00 WAT)."""
         now_utc = datetime.now(timezone.utc)
-        if self.last_briefing_date != now_utc.date() and now_utc.hour >= 6:
-            print("[Alert]: Dispatching Daily Forex Pre-Market Briefing to Telegram...")
-            self.notifier.send_macro_briefing(eur_rep, gbp_rep)
-            self.last_briefing_date = now_utc.date()
+        today = now_utc.date()
 
-    def check_macro_shift(self, pair: str, rep: dict):
-        current_core = self.simplify_bias(rep["macro_bias"])
-        old_core = self.last_core_bias[pair]
+        if self.last_summary_date != today and now_utc.hour >= 20:
+            total = len(self.daily_trades)
+            if total == 0:
+                msg = (
+                    f"📊 <b>FOREX DAILY RECAP ({today.strftime('%d %b')})</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💤 <b>Signals Generated:</b> 0\n"
+                    f"<i>Clean market structure was not met. Zero forced trades. Capital safe.</i>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━"
+                )
+            else:
+                tp1 = sum(1 for t in self.daily_trades if t["status"] in ["HIT_TP1", "HIT_TP2"])
+                tp2 = sum(1 for t in self.daily_trades if t["status"] == "HIT_TP2")
+                sl = sum(1 for t in self.daily_trades if t["status"] == "HIT_SL")
 
-        if old_core is None:
-            self.last_core_bias[pair] = current_core
-            return
+                eur_count = sum(1 for t in self.daily_trades if t["pair"] == "EUR/USD")
+                gbp_count = sum(1 for t in self.daily_trades if t["pair"] == "GBP/USD")
+                win_rate = round((tp1 / total) * 100, 1)
 
-        # ONLY ping if the actual directional polarity flips (e.g. Bearish -> Bullish)
-        if current_core != old_core:
-            self.last_core_bias[pair] = current_core
-            flag = "🇪🇺" if "EUR" in pair else "🇬🇧"
-            msg = (
-                f"🔄 {flag} <b>{pair} MACRO DIRECTION FLIP</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"• <b>Prior Direction:</b> {old_core}\n"
-                f"• <b>New Direction:</b> <b>{current_core}</b> ({rep['macro_score']}/5)\n"
-                f"🎯 <b>Directive:</b> <code>{rep['directive']}</code>"
-            )
+                msg = (
+                    f"📊 <b>MAJOR FOREX DAILY PERFORMANCE</b>\n"
+                    f"📅 <i>{today.strftime('%A, %d %B %Y')}</i>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 <b>Total Signals:</b> {total} (🇪🇺 EUR: {eur_count} | 🇬🇧 GBP: {gbp_count})\n"
+                    f"✅ <b>Hit Target 1:</b> {tp1}\n"
+                    f"🏆 <b>Hit Target 2:</b> {tp2}\n"
+                    f"❌ <b>Hit Stop Loss:</b> {sl}\n"
+                    f"📈 <b>Daily Win Rate:</b> <b>{win_rate}%</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚡ <i>Forex Autonomous Journal</i>"
+                )
+
             self.notifier.send_message(msg)
+            self.last_summary_date = today
 
     def run_cycle(self):
-        timestamp = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        _, session_name, _ = self.get_session_context()
+        market_open, reason = self.is_market_open()
+        if not market_open:
+            print(f"[{datetime.now(timezone.utc).strftime('%H:%M UTC')}] Standby: {reason}")
+            return
+
+        now_utc = datetime.now(timezone.utc)
+
+        if self.last_briefing_date != now_utc.date():
+            self.daily_trades = []
 
         eur_macro = self.macro.calculate_pair_bias("EUR/USD")
         gbp_macro = self.macro.calculate_pair_bias("GBP/USD")
 
-        self.check_daily_briefing(eur_macro, gbp_macro)
+        # Morning Briefing (07:30 WAT)
+        if self.last_briefing_date != now_utc.date() and now_utc.hour >= 6:
+            self.notifier.send_macro_briefing(eur_macro, gbp_macro)
+            self.last_briefing_date = now_utc.date()
 
         for pair, macro_rep in [("EUR/USD", eur_macro), ("GBP/USD", gbp_macro)]:
-            self.check_macro_shift(pair, macro_rep)
-
             smc_rep = self.smc.scan_pair(pair, macro_rep)
             if smc_rep.get("status") != "READY":
                 continue
 
-            levels = smc_rep["levels"]
-            print(f"[{timestamp}] {session_name} | {pair}: {levels['current_price']} | Bias: {macro_rep['macro_bias']}")
+            df = self.smc.fetch_data(pair=pair, interval="15min", outputsize=5)
+            if not df.empty:
+                curr_candle = {"High": df["High"].iloc[-1], "Low": df["Low"].iloc[-1]}
+                self.update_trade_outcomes(pair, curr_candle)
 
             setup = smc_rep.get("active_setup")
             if setup:
                 setup_key = f"{pair}_{setup['signal']}_{setup['entry_zone']}"
                 if setup_key != self.last_signal_keys[pair]:
-                    print(f"🚨 [{pair} TRADE SIGNAL FOUND] Alerting Telegram...")
+                    print(f"🚨 [{pair} SETUP TRIGGERED] Alerting Telegram...")
                     self.notifier.send_forex_trade_alert(setup, macro_rep)
                     self.last_signal_keys[pair] = setup_key
 
+                    try:
+                        self.daily_trades.append({
+                            "pair": pair,
+                            "direction": setup["direction"],
+                            "entry": float(setup["entry_zone"]),
+                            "sl": float(setup["stop_loss"]),
+                            "tp1": float(setup["tp1"]),
+                            "tp2": float(setup["tp2"]),
+                            "status": "OPEN",
+                            "time": now_utc.strftime("%H:%M")
+                        })
+                    except Exception as e:
+                        print(f"[Ledger Error]: {e}")
+
+        # Send Performance Journal at 21:00 WAT
+        self.send_daily_summary()
+
     def start(self):
-        print("==================================================")
-        print("💱 Autonomous Forex Sentinel Active (EUR/USD & GBP/USD)")
-        print("==================================================")
+        print("💱 Autonomous Forex Sentinel Active with Daily Journal")
         while True:
             try:
                 self.run_cycle()
             except Exception as e:
-                print(f"[Forex Scan Error]: {e}")
+                print(f"[Cycle Error]: {e}")
 
-            _, _, sleep_sec = self.get_session_context()
-            time.sleep(sleep_sec)
+            market_open, _ = self.is_market_open()
+            sleep_time = 180 if market_open else 900
+            time.sleep(sleep_time)
 
-# Alias so both names import cleanly without error
 ForexMarketSentinel = ForexSentinel
 
 if __name__ == "__main__":
