@@ -46,15 +46,28 @@ class ForexSMCEngine:
             asian_high = round(asian_df['High'].max(), 5)
             asian_low = round(asian_df['Low'].min(), 5)
         else:
-            today_candles = df[df.index.date == today]
-            asian_high = round(today_candles['High'].iloc[:24].max() if len(today_candles) >= 24 else df['High'].max(), 5)
-            asian_low = round(today_candles['Low'].iloc[:24].min() if len(today_candles) >= 24 else df['Low'].min(), 5)
+            asian_high = round(df['High'].iloc[-24:].max(), 5)
+            asian_low = round(df['Low'].iloc[-24:].min(), 5)
+
+        yesterday_df = df[df.index.date < today]
+        if not yesterday_df.empty:
+            last_date = yesterday_df.index.date.max()
+            last_candles = yesterday_df[yesterday_df.index.date == last_date]
+            pdh = round(last_candles['High'].max(), 5)
+            pdl = round(last_candles['Low'].min(), 5)
+        else:
+            pdh, pdl = asian_high, asian_low
 
         curr_price = round(df['Close'].iloc[-1], 5)
-        return {"current_price": curr_price, "asian_high": asian_high, "asian_low": asian_low}
+        return {
+            "current_price": curr_price,
+            "asian_high": asian_high,
+            "asian_low": asian_low,
+            "pdh": pdh,
+            "pdl": pdl
+        }
 
     def scan_pair(self, pair: str, macro_report: dict) -> dict:
-        """High-Probability Session Breakout & EMA Trend Alignment."""
         df = self.fetch_data(pair=pair, interval="15min", outputsize=100)
         if df.empty or len(df) < 35:
             return {"status": "NO_DATA", "candle": None}
@@ -69,19 +82,17 @@ class ForexSMCEngine:
 
         setup = None
 
-        # --- BEARISH BREAKOUT & MOMENTUM ---
-        # Macro is strongly negative, price has pushed below Asian Low, and trades below 20 EMA
-        if macro_score <= -2.5:
+        # Calibrated to 1.5 so valid momentum trades are permitted
+        if macro_score <= -1.5:
             broke_below = (recent["Close"] < levels["asian_low"]).any()
             momentum_down = curr < df["EMA20"].iloc[-1] and df["EMA20"].iloc[-1] < df["EMA50"].iloc[-1]
 
-            # Invalidation: 15 pips above the 20 EMA (realistic stop loss)
             if broke_below and momentum_down:
                 entry = curr
-                sl_price = round(df["EMA20"].iloc[-1] + (15 * self.pip_size), 5)
+                sl_price = round(df["EMA20"].iloc[-1] + (12 * self.pip_size), 5)
                 risk_pips = round(abs(sl_price - entry) / self.pip_size, 1)
 
-                if 10.0 <= risk_pips <= 25.0:  # Protect against absurd stop loss sizes
+                if 8.0 <= risk_pips <= 30.0:
                     tp1 = round(entry - (risk_pips * 1.5 * self.pip_size), 5)
                     tp2 = round(entry - (risk_pips * 2.5 * self.pip_size), 5)
 
@@ -98,17 +109,16 @@ class ForexSMCEngine:
                         "risk_reward": "1:2.5"
                     }
 
-        # --- BULLISH BREAKOUT & MOMENTUM ---
-        elif macro_score >= 2.5:
+        elif macro_score >= 1.5:
             broke_above = (recent["Close"] > levels["asian_high"]).any()
             momentum_up = curr > df["EMA20"].iloc[-1] and df["EMA20"].iloc[-1] > df["EMA50"].iloc[-1]
 
             if broke_above and momentum_up:
                 entry = curr
-                sl_price = round(df["EMA20"].iloc[-1] - (15 * self.pip_size), 5)
+                sl_price = round(df["EMA20"].iloc[-1] - (12 * self.pip_size), 5)
                 risk_pips = round(abs(entry - sl_price) / self.pip_size, 1)
 
-                if 10.0 <= risk_pips <= 25.0:
+                if 8.0 <= risk_pips <= 30.0:
                     tp1 = round(entry + (risk_pips * 1.5 * self.pip_size), 5)
                     tp2 = round(entry + (risk_pips * 2.5 * self.pip_size), 5)
 
