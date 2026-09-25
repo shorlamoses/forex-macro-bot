@@ -31,29 +31,29 @@ smc_rep = smc_engine.scan_pair(selected_pair, macro_rep)
 
 # 1. Macro Section
 st.subheader(f"🧭 1. {flag} {selected_pair} Macro Drivers")
-score = macro_rep["macro_score"]
+score = macro_rep.get("macro_score", 0)
 score_color = "🟢" if score >= 2 else ("🟩" if score > 0 else ("⚪" if score == 0 else ("🟧" if score >= -2 else "🔴")))
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Macro Bias", f"{score_color} {macro_rep['macro_bias']}", f"Score: {score}/5")
+m1.metric("Macro Bias", f"{score_color} {macro_rep.get('macro_bias')}", f"Score: {score}/5")
 m2.metric("DXY Index", str(macro_rep['dxy']['price']), macro_rep['dxy']['trend'], delta_color="inverse")
-m3.metric("US 10Y Yield", f"{macro_report_us10y := macro_rep['us10y']['yield']}%", macro_rep['us10y']['trend'], delta_color="inverse")
+m3.metric("US 10Y Yield", f"{macro_rep['us10y']['yield']}%", macro_rep['us10y']['trend'], delta_color="inverse")
 m4.metric("Risk Appetite", macro_rep['risk_sentiment']['sentiment'])
 
-st.info(f"**Institutional Directive:** {macro_rep['directive']}")
+st.info(f"**Institutional Directive:** {macro_rep.get('directive')}")
 st.divider()
 
 # 2. SMC Section (Crash-Proof)
 st.subheader(f"🎯 2. {flag} {selected_pair} Structure & Setup")
 if smc_rep.get("status") == "READY":
-    levels = smc_rep["levels"]
-    curr_price = levels["current_price"]
-    pdh_val = levels.get("pdh", levels["asian_high"])
-    pdl_val = levels.get("pdl", levels["asian_low"])
+    levels = smc_rep.get("levels", {})
+    curr_price = levels.get("current_price", 0.0)
+    pdh_val = levels.get("pdh", levels.get("asian_high", 0.0))
+    pdl_val = levels.get("pdl", levels.get("asian_low", 0.0))
 
     l1, l2, l3, l4 = st.columns(4)
     l1.metric("Spot Price", f"{curr_price:.5f}")
-    l2.metric("Asian Range", f"{levels['asian_low']:.5f} - {levels['asian_high']:.5f}")
+    l2.metric("Asian Range", f"{levels.get('asian_low', 0):.5f} - {levels.get('asian_high', 0):.5f}")
     l3.metric("Prev Day Range", f"{pdl_val:.5f} - {pdh_val:.5f}")
     l4.metric("Scan Status", "Active Breakout Sentinel")
 
